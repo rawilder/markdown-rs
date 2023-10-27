@@ -81,10 +81,7 @@ use crate::resolve::Name as ResolveName;
 use crate::state::{Name as StateName, State};
 use crate::subtokenize::Subresult;
 use crate::tokenizer::Tokenizer;
-use crate::util::char::{
-    after_index as char_after_index, before_index as char_before_index, classify_opt,
-    Kind as CharacterKind,
-};
+use crate::util::char::{before_index, kind_after_index, kind_before_index, Kind as CharacterKind};
 use alloc::{vec, vec::Vec};
 
 /// Attentention sequence that we can take markers from.
@@ -239,35 +236,22 @@ fn get_sequences(tokenizer: &mut Tokenizer) -> Vec<Sequence> {
                 let exit = &tokenizer.events[end];
 
                 let marker = tokenizer.parse_state.bytes[enter.point.index];
-                let before = classify_opt(char_before_index(
+                let current_size = exit.point.index - enter.point.index;
+
+                let delimiter_can_open_or_close = delimiter_run_can_open_or_close(
                     tokenizer.parse_state.bytes,
                     enter.point.index,
-                ));
-                let after = classify_opt(char_after_index(
-                    tokenizer.parse_state.bytes,
                     exit.point.index,
-                ));
-                let open = after == CharacterKind::Other
-                    || (after == CharacterKind::Punctuation && before != CharacterKind::Other);
-                let close = before == CharacterKind::Other
-                    || (before == CharacterKind::Punctuation && after != CharacterKind::Other);
+                );
 
                 sequences.push(Sequence {
                     index,
                     stack: stack.clone(),
                     start_point: enter.point.clone(),
                     end_point: exit.point.clone(),
-                    size: exit.point.index - enter.point.index,
-                    open: if marker == b'_' {
-                        open && (before != CharacterKind::Other || !close)
-                    } else {
-                        open
-                    },
-                    close: if marker == b'_' {
-                        close && (after != CharacterKind::Other || !open)
-                    } else {
-                        close
-                    },
+                    size: current_size,
+                    open: delimiter_can_open_or_close.can_open,
+                    close: delimiter_can_open_or_close.can_close,
                     marker,
                 });
             }
@@ -433,4 +417,119 @@ fn match_sequences(
     }
 
     next
+}
+
+/*
+A left-flanking delimiter run is a delimiter run that is
+(1) not followed by Unicode whitespace, and either
+(2a) not followed by a punctuation character,
+or
+(2b) followed by a punctuation character and preceded by Unicode whitespace or a punctuation character.
+
+For purposes of this definition, the beginning and the end of the line count as Unicode whitespace.
+ */
+fn is_left_flanking_delimiter_run(bytes: &[u8], start_index: usize, end_index: usize) -> bool {
+    let before = kind_before_index(bytes, start_index);
+    let after = kind_after_index(bytes, end_index);
+
+    // (1) not followed by Unicode whitespace
+    // (2a) not followed by a punctuation character
+    // (2b) followed by a punctuation character and preceded by Unicode whitespace or a punctuation character)
+    after != CharacterKind::Whitespace
+        && (after != CharacterKind::Punctuation
+            || before == CharacterKind::Whitespace
+            || before == CharacterKind::Punctuation)
+}
+
+/*
+A right-flanking delimiter run is a delimiter run that is
+(1) not preceded by Unicode whitespace, and either
+(2a) not preceded by a punctuation character,
+or
+(2b) preceded by a punctuation character and followed by Unicode whitespace or a punctuation character.
+
+For purposes of this definition, the beginning and the end of the line count as Unicode whitespace.
+ */
+fn is_right_flanking_delimiter_run(bytes: &[u8], start_index: usize, end_index: usize) -> bool {
+    let after = kind_after_index(bytes, end_index);
+
+    /*
+    github has the lovely behavior of not following its own spec.
+    i've tried a few different markdown parsers and they all will correctly treat
+    ~ like a punctuation in determining right-flanking delimiter runs.
+    but github doesn't and it makes their markdown display differently.
+     */
+    let before = if before_index(bytes, start_index) == Some('~') {
+        CharacterKind::Other
+    } else {
+        kind_before_index(bytes, start_index)
+    };
+
+    before != CharacterKind::Whitespace
+        && (before != CharacterKind::Punctuation
+            || after == CharacterKind::Whitespace
+            || after == CharacterKind::Punctuation)
+}
+
+struct CanOpenOrClose {
+    can_open: bool,
+    can_close: bool,
+}
+
+fn delimiter_run_can_open_or_close(
+    bytes: &[u8],
+    start_index: usize,
+    end_index: usize,
+) -> CanOpenOrClose {
+    match bytes[start_index] {
+        b'~' => {
+            // gfm spec says 2 tildes max: https://github.github.com/gfm/#strikethrough-extension-
+            if let 1..=2 = end_index - start_index {
+                CanOpenOrClose {
+                    can_open: is_left_flanking_delimiter_run(bytes, start_index, end_index),
+                    can_close: is_right_flanking_delimiter_run(bytes, start_index, end_index),
+                }
+            } else {
+                CanOpenOrClose {
+                    can_open: false,
+                    can_close: false,
+                }
+            }
+        }
+        b'*' => CanOpenOrClose {
+            can_open: is_left_flanking_delimiter_run(bytes, start_index, end_index),
+            can_close: is_right_flanking_delimiter_run(bytes, start_index, end_index),
+        },
+        b'_' => {
+            let is_left_flanking = is_left_flanking_delimiter_run(bytes, start_index, end_index);
+            let is_right_flanking = is_right_flanking_delimiter_run(bytes, start_index, end_index);
+            if is_left_flanking && !is_right_flanking {
+                CanOpenOrClose {
+                    can_open: true,
+                    can_close: false,
+                }
+            } else if is_right_flanking && !is_left_flanking {
+                CanOpenOrClose {
+                    can_open: false,
+                    can_close: true,
+                }
+            } else if is_right_flanking && is_left_flanking {
+                let before = kind_before_index(bytes, start_index);
+                let after = kind_after_index(bytes, end_index);
+                CanOpenOrClose {
+                    can_open: before == CharacterKind::Punctuation,
+                    can_close: after == CharacterKind::Punctuation,
+                }
+            } else {
+                CanOpenOrClose {
+                    can_open: false,
+                    can_close: false,
+                }
+            }
+        }
+        _ => CanOpenOrClose {
+            can_open: false,
+            can_close: false,
+        },
+    }
 }
